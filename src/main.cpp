@@ -214,10 +214,10 @@ static void addSPButton(CCLayer* layer, CCObject* target, SEL_MenuHandler handle
         menu->addChild(btn);
         menu->updateLayout();
     } else {
-        auto menu = CCMenu::create();
-        menu->setPosition({ 25.f, 25.f });
-        menu->addChild(btn);
-        layer->addChild(menu, 10);
+        auto fallback = CCMenu::create();
+        fallback->setPosition({ 25.f, 25.f });
+        fallback->addChild(btn);
+        layer->addChild(fallback, 10);
     }
 }
 
