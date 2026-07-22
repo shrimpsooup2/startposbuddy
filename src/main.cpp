@@ -2,14 +2,108 @@
 #include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/EditLevelLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <geode.custom-keybinds/include/Keybinds.hpp>
+#include <Geode/loader/SettingV3.hpp>
+#include <Geode/utils/base64.hpp>
+#include <miniz.h>
 
 using namespace geode::prelude;
-using namespace keybinds;
 
-// ---------- link storage (persisted as flat saved values: "link_<key>" -> <key>) ----------
+// ---------- gzip/zlib helpers ----------
+// GD level strings are URL-safe base64 of a gzip deflate stream. RobTop's
+// ZipUtils::(de)compressString is inlined on Windows (no callable address),
+// so we do it ourselves with miniz. GD's inflate accepts both zlib and gzip,
+// so we WRITE zlib (trivial with miniz) and READ either.
 
-// key format: "o:<id>" for online levels, "l:<name>" for local/editor levels
+static std::optional<std::string> inflateLevelString(std::string const& b64) {
+    auto res = utils::base64::decodeString(b64, utils::base64::Base64Variant::Url);
+    if (res.isErr()) return std::nullopt;
+    std::string raw = res.unwrap();
+    if (raw.empty()) return std::nullopt;
+
+    auto p = reinterpret_cast<unsigned char const*>(raw.data());
+    size_t n = raw.size();
+    size_t skip = 0;
+    int flags = 0;
+
+    if (n >= 2 && p[0] == 0x1f && p[1] == 0x8b) {
+        // gzip: skip the header (usually 10 bytes), then raw deflate
+        unsigned char flg = (n >= 4) ? p[3] : 0;
+        skip = 10;
+        if (flg & 4) { // FEXTRA
+            if (skip + 2 > n) return std::nullopt;
+            size_t xlen = p[skip] | (p[skip + 1] << 8);
+            skip += 2 + xlen;
+        }
+        if (flg & 8)  { while (skip < n && p[skip]) skip++; skip++; } // FNAME
+        if (flg & 16) { while (skip < n && p[skip]) skip++; skip++; } // FCOMMENT
+        if (flg & 2)  { skip += 2; }                                  // FHCRC
+    } else if (n >= 1 && p[0] == 0x78) {
+        flags = TINFL_FLAG_PARSE_ZLIB_HEADER;
+    }
+    if (skip >= n) return std::nullopt;
+
+    size_t outLen = 0;
+    void* out = tinfl_decompress_mem_to_heap(p + skip, n - skip, &outLen, flags);
+    if (!out) return std::nullopt;
+    std::string result(static_cast<char*>(out), outLen);
+    mz_free(out);
+    return result;
+}
+
+static std::optional<std::string> deflateLevelString(std::string const& data) {
+    mz_ulong bound = mz_compressBound(static_cast<mz_ulong>(data.size()));
+    std::vector<unsigned char> out(bound);
+    int r = mz_compress2(
+        out.data(), &bound,
+        reinterpret_cast<unsigned char const*>(data.data()), static_cast<mz_ulong>(data.size()),
+        MZ_BEST_COMPRESSION
+    );
+    if (r != MZ_OK) return std::nullopt;
+    std::string zlib(reinterpret_cast<char*>(out.data()), bound);
+    return utils::base64::encode(zlib, utils::base64::Base64Variant::Url);
+}
+
+// takes a (compressed OR already-plain) level string, adds a startpos object,
+// returns the new compressed level string
+static std::optional<std::string> withStartpos(std::string const& source, std::string const& spObj, bool replaceExisting) {
+    std::string objects;
+    if (auto inflated = inflateLevelString(source)) {
+        objects = *inflated;
+    } else if (source.find(';') != std::string::npos && source.find(',') != std::string::npos) {
+        objects = source; // already decompressed
+    } else {
+        return std::nullopt;
+    }
+
+    if (replaceExisting) {
+        std::string kept;
+        size_t pos = 0;
+        bool isHeader = true;
+        while (pos <= objects.size()) {
+            size_t end = objects.find(';', pos);
+            if (end == std::string::npos) end = objects.size();
+            auto tok = objects.substr(pos, end - pos);
+            bool isStartpos = !isHeader && (tok.rfind("1,31,", 0) == 0 || tok == "1,31");
+            if (!tok.empty() && !isStartpos) {
+                kept += tok;
+                kept += ';';
+            }
+            isHeader = false;
+            if (end == objects.size()) break;
+            pos = end + 1;
+        }
+        objects = std::move(kept);
+    }
+
+    if (!objects.empty() && objects.back() != ';') objects += ';';
+    objects += spObj;
+    objects += ';';
+    return deflateLevelString(objects);
+}
+
+// ---------- link storage (saved values: "link_<key>" -> "<key>") ----------
+// key: "o:<id>" for online levels, "l:<name>" for local/editor levels
+
 static std::string levelKey(GJGameLevel* level) {
     if (level->m_levelID.value() > 0) {
         return fmt::format("o:{}", level->m_levelID.value());
@@ -22,7 +116,6 @@ static std::string getLink(std::string const& key) {
 }
 
 static void setLink(std::string const& a, std::string const& b) {
-    // clear previous links of both sides so pairs stay consistent
     for (auto const& k : { a, b }) {
         auto old = getLink(k);
         if (!old.empty()) Mod::get()->setSavedValue<std::string>("link_" + old, "");
@@ -53,45 +146,6 @@ static GJGameLevel* resolveKey(std::string const& key) {
 static std::string displayName(std::string const& key) {
     if (auto lvl = resolveKey(key)) return std::string(lvl->m_levelName);
     return key;
-}
-
-// ---------- level string helpers ----------
-
-static std::string decodedLevelString(GJGameLevel* level) {
-    std::string raw = level->m_levelString;
-    if (raw.empty()) return raw;
-    if (raw.rfind("H4sIA", 0) == 0) {
-        return ZipUtils::decompressString(raw, true, 0);
-    }
-    return raw;
-}
-
-// appends (or replaces) a startpos object in a decompressed level string,
-// then stores it back compressed
-static void applyStartpos(GJGameLevel* level, std::string objects, std::string const& spObj, bool replaceExisting) {
-    if (replaceExisting) {
-        std::string out;
-        out.reserve(objects.size());
-        size_t pos = 0;
-        bool header = true;
-        while (pos < objects.size()) {
-            auto end = objects.find(';', pos);
-            if (end == std::string::npos) end = objects.size();
-            auto tok = objects.substr(pos, end - pos);
-            bool isStartpos = !header && (tok.rfind("1,31,", 0) == 0 || tok == "1,31");
-            if (!tok.empty() && !isStartpos) {
-                out += tok;
-                out += ';';
-            }
-            header = false;
-            pos = end + 1;
-        }
-        objects = std::move(out);
-    }
-    if (!objects.empty() && objects.back() != ';') objects += ';';
-    objects += spObj;
-    objects += ';';
-    level->m_levelString = ZipUtils::compressString(objects, true, 0);
 }
 
 // ---------- linking UI (SP button on level pages) ----------
@@ -189,41 +243,26 @@ struct $modify(SPEditLevel, EditLevelLayer) {
     }
 };
 
-// ---------- keybinds ----------
-
-$execute {
-    BindManager::get()->registerBindable({
-        "switch"_spr,
-        "Switch Level Version",
-        "Swap between the current level and its linked StartPos version.",
-        { Keybind::create(KEY_Tab, Modifier::None) },
-        "StartPos Buddy"
-    });
-    BindManager::get()->registerBindable({
-        "add-startpos"_spr,
-        "Add StartPos Here",
-        "Adds a StartPos at your current position to a local copy of the level (creates and links the copy automatically). Best used in practice mode.",
-        { Keybind::create(KEY_E, Modifier::None) },
-        "StartPos Buddy"
-    });
-}
-
 // ---------- in-game logic ----------
 
 struct $modify(SPPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        this->template addEventListener<InvokeBindFilter>([this](InvokeBindEvent* event) {
-            if (event->isDown()) this->switchVersion();
-            return ListenerResult::Propagate;
-        }, "switch"_spr);
-
-        this->template addEventListener<InvokeBindFilter>([this](InvokeBindEvent* event) {
-            if (event->isDown()) this->addStartpos();
-            return ListenerResult::Propagate;
-        }, "add-startpos"_spr);
-
+        this->addEventListener(
+            KeybindSettingPressedEventV3(Mod::get(), "switch"),
+            [this](Keybind const&, bool down, bool repeat, double) {
+                if (down && !repeat) this->switchVersion();
+                return ListenerResult::Propagate;
+            }
+        );
+        this->addEventListener(
+            KeybindSettingPressedEventV3(Mod::get(), "add-startpos"),
+            [this](Keybind const&, bool down, bool repeat, double) {
+                if (down && !repeat) this->addStartpos();
+                return ListenerResult::Propagate;
+            }
+        );
         return true;
     }
 
@@ -248,11 +287,7 @@ struct $modify(SPPlayLayer, PlayLayer) {
 
     void addStartpos() {
         auto p = m_player1;
-        auto decomp = decodedLevelString(m_level);
-        if (decomp.empty()) {
-            Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
-            return;
-        }
+        if (!p) return;
 
         int mode = 0;
         if (p->m_isShip) mode = 1;
@@ -263,40 +298,53 @@ struct $modify(SPPlayLayer, PlayLayer) {
         else if (p->m_isSpider) mode = 6;
         else if (p->m_isSwing) mode = 7;
 
-        int speed = 0;
+        int mini = (p->m_vehicleSize < 1.0f) ? 1 : 0;
+
+        int speed;
         float s = p->m_playerSpeed;
         if (s < 0.8f) speed = 1;        // 0.5x
-        else if (s < 1.0f) speed = 0;   // 1x
-        else if (s < 1.2f) speed = 2;   // 2x
-        else if (s < 1.45f) speed = 3;  // 3x
+        else if (s < 1.1f) speed = 0;   // 1x
+        else if (s < 1.3f) speed = 2;   // 2x
+        else if (s < 1.6f) speed = 3;   // 3x
         else speed = 4;                 // 4x
 
-        // startpos object: id 31, embeds its settings as kA keys
+        int dual = (m_player2 && m_player2->isVisible()) ? 1 : 0;
+
         auto spObj = fmt::format(
-            "1,31,2,{:.2f},3,{:.2f},kA2,{},kA3,{},kA4,{},kA8,{},kA11,{}",
-            p->getPositionX(), p->getPositionY(),
-            mode,
-            p->m_vehicleSize < 1.f ? 1 : 0,   // mini
-            speed,
-            (m_player2 && m_player2->isVisible()) ? 1 : 0, // dual
-            p->m_isUpsideDown ? 1 : 0          // flipped gravity
+            "1,31,2,{:.2f},3,{:.2f},kA2,{},kA3,{},kA4,{},kA8,{}",
+            p->getPositionX(), p->getPositionY(), mode, mini, speed, dual
         );
 
         bool replace = Mod::get()->getSettingValue<bool>("replace-existing");
 
         if (m_level->m_levelType == GJLevelType::Editor) {
-            // already a local level: add the startpos to it directly
-            applyStartpos(m_level, decomp, spObj, replace);
-            Notification::create("StartPos added - takes effect when the level reloads", NotificationIcon::Success)->show();
+            // local level: add the startpos to it directly
+            auto result = withStartpos(std::string(m_level->m_levelString), spObj, replace);
+            if (!result) {
+                Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
+                return;
+            }
+            m_level->m_levelString = *result;
+            Notification::create("StartPos added - reopen the level to see it", NotificationIcon::Success)->show();
         } else {
-            // online level: create/update a local "<name> SP" copy and link it
+            // online/main level: create or update a local "<name> SP" copy and link it
             auto copyName = std::string(m_level->m_levelName) + " SP";
             GJGameLevel* copy = nullptr;
             for (auto lvl : CCArrayExt<GJGameLevel*>(LocalLevelManager::sharedState()->m_localLevels)) {
                 if (std::string(lvl->m_levelName) == copyName) { copy = lvl; break; }
             }
+
+            std::string source = (copy && !std::string(copy->m_levelString).empty())
+                ? std::string(copy->m_levelString)
+                : std::string(m_level->m_levelString);
+
+            auto result = withStartpos(source, spObj, replace);
+            if (!result) {
+                Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
+                return;
+            }
+
             bool created = false;
-            std::string base = decomp;
             if (!copy) {
                 copy = GJGameLevel::create();
                 copy->m_levelName = copyName;
@@ -307,11 +355,8 @@ struct $modify(SPPlayLayer, PlayLayer) {
                 copy->m_sfxIDs = m_level->m_sfxIDs;
                 LocalLevelManager::sharedState()->m_localLevels->insertObject(copy, 0);
                 created = true;
-            } else {
-                auto existing = decodedLevelString(copy);
-                if (!existing.empty()) base = existing;
             }
-            applyStartpos(copy, base, spObj, replace);
+            copy->m_levelString = *result;
             setLink(levelKey(m_level), levelKey(copy));
             Notification::create(
                 created

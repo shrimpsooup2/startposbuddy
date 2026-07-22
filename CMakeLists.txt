@@ -15,4 +15,14 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
+# miniz: cross-platform gzip/zlib. RobTop's ZipUtils::(de)compressString is
+# inlined on Windows and therefore not callable, so we bring our own.
+CPMAddPackage(
+    NAME miniz
+    GITHUB_REPOSITORY richgel999/miniz
+    VERSION 3.0.2
+    OPTIONS "BUILD_EXAMPLES OFF" "BUILD_TESTS OFF" "BUILD_FUZZERS OFF" "AMALGAMATE_SOURCES OFF" "INSTALL_PROJECT OFF"
+)
+target_link_libraries(${PROJECT_NAME} miniz)
+
 setup_geode_mod(${PROJECT_NAME})
