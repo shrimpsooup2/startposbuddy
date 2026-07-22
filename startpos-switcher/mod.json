@@ -1,0 +1,20 @@
+{
+    "geode": "4.4.0",
+    "gd": { "win": "2.2074" },
+    "id": "andre.startpos-buddy",
+    "name": "StartPos Buddy",
+    "version": "v1.0.0",
+    "developer": "andre",
+    "description": "Link levels with their StartPos versions and hot-swap between them with a keybind.",
+    "dependencies": [
+        { "id": "geode.custom-keybinds", "version": ">=1.10.0", "importance": "required" }
+    ],
+    "settings": {
+        "replace-existing": {
+            "name": "Replace Existing StartPos",
+            "description": "When adding a StartPos, remove previous StartPos objects instead of keeping them (i.e. 'move' the StartPos instead of adding another).",
+            "type": "bool",
+            "default": false
+        }
+    }
+}
