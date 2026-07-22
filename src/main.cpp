@@ -8,11 +8,11 @@
 
 using namespace geode::prelude;
 
-// ---------- gzip/zlib helpers ----------
+// ---------- gzip helpers ----------
 // GD level strings are URL-safe base64 of a gzip deflate stream. RobTop's
 // ZipUtils::(de)compressString is inlined on Windows (no callable address),
-// so we do it ourselves with miniz. GD's inflate accepts both zlib and gzip,
-// so we WRITE zlib (trivial with miniz) and READ either.
+// so we do it ourselves with miniz: we WRITE gzip (what GD expects) and READ
+// either gzip or zlib.
 
 static std::optional<std::string> inflateLevelString(std::string const& b64) {
     auto res = utils::base64::decodeString(b64, utils::base64::Base64Variant::Url);
@@ -169,6 +169,27 @@ static GJGameLevel* findLocalByName(std::string const& name) {
     return nullptr;
 }
 
+static std::string uniqueLocalName(std::string const& base) {
+    if (!findLocalByName(base)) return base;
+    for (int i = 2; ; i++) {
+        auto candidate = fmt::format("{} {}", base, i);
+        if (!findLocalByName(candidate)) return candidate;
+    }
+}
+
+static GJGameLevel* createLocalCopy(GJGameLevel* meta, std::string const& name, std::string const& levelString) {
+    auto copy = GJGameLevel::create();
+    copy->m_levelName = name;
+    copy->m_levelType = GJLevelType::Editor;
+    copy->m_audioTrack = meta->m_audioTrack;
+    copy->m_songID = meta->m_songID;
+    copy->m_songIDs = meta->m_songIDs;
+    copy->m_sfxIDs = meta->m_sfxIDs;
+    copy->m_levelString = levelString;
+    LocalLevelManager::sharedState()->m_localLevels->insertObject(copy, 0);
+    return copy;
+}
+
 // ---------- linking UI (SP button on level pages) ----------
 
 static std::string s_pending; // level marked for linking this session
@@ -302,11 +323,12 @@ struct $modify(SPPlayLayer, PlayLayer) {
             Notification::create("Linked level has no data - open it once first", NotificationIcon::Error)->show();
             return;
         }
-        // defer to the next frame so the current PlayLayer tears down cleanly
-        // (replacing the scene mid-update breaks other mods' save-on-exit hooks)
+        // defer to the next frame and replace WITHOUT a transition, so the old
+        // PlayLayer is fully torn down before the new one inits. A transition
+        // keeps both PlayLayers alive at once, which trips up other mods that
+        // rely on PlayLayer::get() (e.g. Death Tracker saving on exit).
         Loader::get()->queueInMainThread([other]() {
-            auto scene = PlayLayer::scene(other, false, false);
-            CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.5f, scene));
+            CCDirector::sharedDirector()->replaceScene(PlayLayer::scene(other, false, false));
         });
     }
 
@@ -342,69 +364,52 @@ struct $modify(SPPlayLayer, PlayLayer) {
 
         bool replace = Mod::get()->getSettingValue<bool>("replace-existing");
 
-        // Figure out which LOCAL level to add the StartPos into. We always
-        // accumulate StartPoses in a local (editable) level:
-        //   - if we're already playing a local level, use it
-        //   - else if this level already has a linked local level, use that
-        //     one (building on its current contents)
-        //   - else create a fresh "<name> SP" copy of this level and link it
-        GJGameLevel* target = nullptr;
+        // Find the online "anchor" level we keep the link on, plus any existing
+        // linked StartPos copy whose StartPoses we want to carry over.
+        GJGameLevel* anchor = m_level;
+        GJGameLevel* existingSP = nullptr;
 
         if (m_level->m_levelType == GJLevelType::Editor) {
-            target = m_level;
+            // we're playing a StartPos copy: build on its contents, and keep the
+            // link on whatever online level it points back to
+            existingSP = m_level;
+            if (auto lk = getLink(levelKey(m_level)); !lk.empty()) {
+                if (auto o = resolveKey(lk)) anchor = o;
+            }
         } else {
-            if (auto linkedKey = getLink(levelKey(m_level)); !linkedKey.empty()) {
-                if (auto linked = resolveKey(linkedKey);
-                    linked && linked->m_levelType == GJLevelType::Editor) {
-                    target = linked;
+            // online level: find its linked local StartPos copy (or one by name)
+            if (auto lk = getLink(levelKey(m_level)); !lk.empty()) {
+                if (auto sp = resolveKey(lk); sp && sp->m_levelType == GJLevelType::Editor) {
+                    existingSP = sp;
                 }
             }
-            if (!target) {
-                auto copyName = std::string(m_level->m_levelName) + " SP";
-                if (auto existing = findLocalByName(copyName)) {
-                    target = existing;
-                    setLink(levelKey(m_level), levelKey(target));
-                }
+            if (!existingSP) {
+                existingSP = findLocalByName(std::string(m_level->m_levelName) + " SP");
             }
         }
 
-        if (!target) {
-            // first time for this online level: create the linked local copy
-            auto copyName = std::string(m_level->m_levelName) + " SP";
-            auto result = withStartpos(std::string(m_level->m_levelString), spObj, replace);
-            if (!result) {
-                Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
-                return;
-            }
-            auto copy = GJGameLevel::create();
-            copy->m_levelName = copyName;
-            copy->m_levelType = GJLevelType::Editor;
-            copy->m_audioTrack = m_level->m_audioTrack;
-            copy->m_songID = m_level->m_songID;
-            copy->m_songIDs = m_level->m_songIDs;
-            copy->m_sfxIDs = m_level->m_sfxIDs;
-            copy->m_levelString = *result;
-            LocalLevelManager::sharedState()->m_localLevels->insertObject(copy, 0);
-            setLink(levelKey(m_level), levelKey(copy));
-            Notification::create(
-                fmt::format("Created '{}' - press the switch keybind to play it", copyName),
-                NotificationIcon::Success
-            )->show();
-            return;
-        }
+        // build from the existing StartPos copy (keeps its StartPoses) when there
+        // is one, otherwise from the level being played
+        std::string base = existingSP
+            ? std::string(existingSP->m_levelString)
+            : std::string(m_level->m_levelString);
 
-        // accumulate into the existing local target (preserving its contents)
-        auto result = withStartpos(std::string(target->m_levelString), spObj, replace);
+        auto result = withStartpos(base, spObj, replace);
         if (!result) {
-            Notification::create("Couldn't read the linked level's data", NotificationIcon::Error)->show();
+            Notification::create("Couldn't read the level's data", NotificationIcon::Error)->show();
             return;
         }
-        target->m_levelString = *result;
-        if (target != m_level) setLink(levelKey(m_level), levelKey(target));
+
+        // always write to a FRESH copy so earlier StartPos versions are kept, and
+        // point the anchor's link at the newest copy
+        auto name = uniqueLocalName(std::string(anchor->m_levelName) + " SP");
+        auto copy = createLocalCopy(m_level, name, *result);
+        setLink(levelKey(anchor), levelKey(copy));
+
         Notification::create(
-            (target == m_level)
-                ? "StartPos added - reopen the level to see it"
-                : "StartPos added to the linked copy",
+            existingSP
+                ? fmt::format("StartPos added - new copy '{}' (older ones kept)", name)
+                : fmt::format("Created '{}' - press the switch keybind to play it", name),
             NotificationIcon::Success
         )->show();
     }
