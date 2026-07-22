@@ -51,16 +51,30 @@ static std::optional<std::string> inflateLevelString(std::string const& b64) {
 }
 
 static std::optional<std::string> deflateLevelString(std::string const& data) {
-    mz_ulong bound = mz_compressBound(static_cast<mz_ulong>(data.size()));
-    std::vector<unsigned char> out(bound);
-    int r = mz_compress2(
-        out.data(), &bound,
-        reinterpret_cast<unsigned char const*>(data.data()), static_cast<mz_ulong>(data.size()),
-        MZ_BEST_COMPRESSION
+    // GD level strings are gzip (not zlib). Produce a real gzip container so
+    // RobTop's inflate accepts it: 10-byte header + raw deflate + crc32 + isize.
+    int flags = static_cast<int>(
+        tdefl_create_comp_flags_from_zip_params(MZ_DEFAULT_LEVEL, -15, MZ_DEFAULT_STRATEGY)
     );
-    if (r != MZ_OK) return std::nullopt;
-    std::string zlib(reinterpret_cast<char*>(out.data()), bound);
-    return utils::base64::encode(zlib, utils::base64::Base64Variant::Url);
+    size_t deflatedLen = 0;
+    void* deflated = tdefl_compress_mem_to_heap(data.data(), data.size(), &deflatedLen, flags);
+    if (!deflated) return std::nullopt;
+
+    std::string gz;
+    gz.reserve(deflatedLen + 18);
+    const unsigned char header[10] = { 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff };
+    gz.append(reinterpret_cast<char const*>(header), 10);
+    gz.append(static_cast<char const*>(deflated), deflatedLen);
+    mz_free(deflated);
+
+    unsigned int crc = static_cast<unsigned int>(
+        mz_crc32(MZ_CRC32_INIT, reinterpret_cast<unsigned char const*>(data.data()), data.size())
+    );
+    unsigned int isize = static_cast<unsigned int>(data.size());
+    for (int i = 0; i < 4; i++) gz.push_back(static_cast<char>((crc >> (8 * i)) & 0xff));
+    for (int i = 0; i < 4; i++) gz.push_back(static_cast<char>((isize >> (8 * i)) & 0xff));
+
+    return utils::base64::encode(gz, utils::base64::Base64Variant::Url);
 }
 
 // takes a (compressed OR already-plain) level string, adds a startpos object,
@@ -146,6 +160,13 @@ static GJGameLevel* resolveKey(std::string const& key) {
 static std::string displayName(std::string const& key) {
     if (auto lvl = resolveKey(key)) return std::string(lvl->m_levelName);
     return key;
+}
+
+static GJGameLevel* findLocalByName(std::string const& name) {
+    for (auto lvl : CCArrayExt<GJGameLevel*>(LocalLevelManager::sharedState()->m_localLevels)) {
+        if (std::string(lvl->m_levelName) == name) return lvl;
+    }
+    return nullptr;
 }
 
 // ---------- linking UI (SP button on level pages) ----------
@@ -281,8 +302,12 @@ struct $modify(SPPlayLayer, PlayLayer) {
             Notification::create("Linked level has no data - open it once first", NotificationIcon::Error)->show();
             return;
         }
-        auto scene = PlayLayer::scene(other, false, false);
-        CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.5f, scene));
+        // defer to the next frame so the current PlayLayer tears down cleanly
+        // (replacing the scene mid-update breaks other mods' save-on-exit hooks)
+        Loader::get()->queueInMainThread([other]() {
+            auto scene = PlayLayer::scene(other, false, false);
+            CCDirector::sharedDirector()->replaceScene(CCTransitionFade::create(0.5f, scene));
+        });
     }
 
     void addStartpos() {
@@ -317,53 +342,70 @@ struct $modify(SPPlayLayer, PlayLayer) {
 
         bool replace = Mod::get()->getSettingValue<bool>("replace-existing");
 
+        // Figure out which LOCAL level to add the StartPos into. We always
+        // accumulate StartPoses in a local (editable) level:
+        //   - if we're already playing a local level, use it
+        //   - else if this level already has a linked local level, use that
+        //     one (building on its current contents)
+        //   - else create a fresh "<name> SP" copy of this level and link it
+        GJGameLevel* target = nullptr;
+
         if (m_level->m_levelType == GJLevelType::Editor) {
-            // local level: add the startpos to it directly
+            target = m_level;
+        } else {
+            if (auto linkedKey = getLink(levelKey(m_level)); !linkedKey.empty()) {
+                if (auto linked = resolveKey(linkedKey);
+                    linked && linked->m_levelType == GJLevelType::Editor) {
+                    target = linked;
+                }
+            }
+            if (!target) {
+                auto copyName = std::string(m_level->m_levelName) + " SP";
+                if (auto existing = findLocalByName(copyName)) {
+                    target = existing;
+                    setLink(levelKey(m_level), levelKey(target));
+                }
+            }
+        }
+
+        if (!target) {
+            // first time for this online level: create the linked local copy
+            auto copyName = std::string(m_level->m_levelName) + " SP";
             auto result = withStartpos(std::string(m_level->m_levelString), spObj, replace);
             if (!result) {
                 Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
                 return;
             }
-            m_level->m_levelString = *result;
-            Notification::create("StartPos added - reopen the level to see it", NotificationIcon::Success)->show();
-        } else {
-            // online/main level: create or update a local "<name> SP" copy and link it
-            auto copyName = std::string(m_level->m_levelName) + " SP";
-            GJGameLevel* copy = nullptr;
-            for (auto lvl : CCArrayExt<GJGameLevel*>(LocalLevelManager::sharedState()->m_localLevels)) {
-                if (std::string(lvl->m_levelName) == copyName) { copy = lvl; break; }
-            }
-
-            std::string source = (copy && !std::string(copy->m_levelString).empty())
-                ? std::string(copy->m_levelString)
-                : std::string(m_level->m_levelString);
-
-            auto result = withStartpos(source, spObj, replace);
-            if (!result) {
-                Notification::create("Couldn't read this level's data", NotificationIcon::Error)->show();
-                return;
-            }
-
-            bool created = false;
-            if (!copy) {
-                copy = GJGameLevel::create();
-                copy->m_levelName = copyName;
-                copy->m_levelType = GJLevelType::Editor;
-                copy->m_audioTrack = m_level->m_audioTrack;
-                copy->m_songID = m_level->m_songID;
-                copy->m_songIDs = m_level->m_songIDs;
-                copy->m_sfxIDs = m_level->m_sfxIDs;
-                LocalLevelManager::sharedState()->m_localLevels->insertObject(copy, 0);
-                created = true;
-            }
+            auto copy = GJGameLevel::create();
+            copy->m_levelName = copyName;
+            copy->m_levelType = GJLevelType::Editor;
+            copy->m_audioTrack = m_level->m_audioTrack;
+            copy->m_songID = m_level->m_songID;
+            copy->m_songIDs = m_level->m_songIDs;
+            copy->m_sfxIDs = m_level->m_sfxIDs;
             copy->m_levelString = *result;
+            LocalLevelManager::sharedState()->m_localLevels->insertObject(copy, 0);
             setLink(levelKey(m_level), levelKey(copy));
             Notification::create(
-                created
-                    ? fmt::format("Created '{}' - press the switch keybind to play it", copyName)
-                    : "StartPos copy updated",
+                fmt::format("Created '{}' - press the switch keybind to play it", copyName),
                 NotificationIcon::Success
             )->show();
+            return;
         }
+
+        // accumulate into the existing local target (preserving its contents)
+        auto result = withStartpos(std::string(target->m_levelString), spObj, replace);
+        if (!result) {
+            Notification::create("Couldn't read the linked level's data", NotificationIcon::Error)->show();
+            return;
+        }
+        target->m_levelString = *result;
+        if (target != m_level) setLink(levelKey(m_level), levelKey(target));
+        Notification::create(
+            (target == m_level)
+                ? "StartPos added - reopen the level to see it"
+                : "StartPos added to the linked copy",
+            NotificationIcon::Success
+        )->show();
     }
 };
